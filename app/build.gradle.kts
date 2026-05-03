@@ -1,3 +1,16 @@
+import java.util.Properties
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use(::load)
+    }
+}
+
+fun quoteBuildConfigString(value: String): String {
+    return "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+}
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -11,6 +24,20 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file(
+                localProperties.getProperty("keystore.file", "simpmang.keystore")
+            )
+            storePassword = localProperties.getProperty("keystore.password", "")
+            keyAlias = localProperties.getProperty("keystore.alias", "")
+            keyPassword = localProperties.getProperty(
+                "keystore.keyPassword",
+                localProperties.getProperty("keystore.password", "")
+            )
+        }
+    }
+
     defaultConfig {
         applicationId = "com.freddy.simpmang"
         minSdk = 29
@@ -18,11 +45,26 @@ android {
         versionCode = 1
         versionName = "1.0"
 
+        buildConfigField(
+            "String",
+            "BAIDU_OCR_API_KEY",
+            quoteBuildConfigString(localProperties.getProperty("baidu.ocr.apiKey", ""))
+        )
+        buildConfigField(
+            "String",
+            "BAIDU_OCR_SECRET_KEY",
+            quoteBuildConfigString(localProperties.getProperty("baidu.ocr.secretKey", ""))
+        )
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("release")
+        }
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -35,6 +77,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 }
