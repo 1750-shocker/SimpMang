@@ -38,6 +38,7 @@ import com.baidu.ocr.sdk.model.GeneralResult
 import com.baidu.ocr.sdk.model.Word
 import com.baidu.ocr.sdk.model.WordSimple
 import com.freddy.simpmang.ui.theme.SimpMangTheme
+import com.github.houbb.opencc4j.util.ZhConverterUtil
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -190,9 +191,19 @@ class MainActivity : ComponentActivity() {
 
         return buildString {
             result.wordList.forEachIndexed { index, word ->
+                val original = word.words.orEmpty()
                 append(index + 1)
                 append(". ")
-                append(word.words.orEmpty())
+                append(original)
+                val simplified = try {
+                    ZhConverterUtil.toSimple(original)
+                } catch (_: Exception) {
+                    original
+                }
+                if (simplified != original) {
+                    append("  →  ")
+                    append(simplified)
+                }
                 if (word is Word) {
                     word.location?.let { location ->
                         append("  [left=")
