@@ -1,9 +1,21 @@
 package com.freddy.simpmang
 
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
-import androidx.activity.compose.rememberLauncherForActivityResult
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,7 +35,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -40,6 +51,7 @@ import com.baidu.ocr.sdk.model.WordSimple
 import com.freddy.simpmang.ui.theme.SimpMangTheme
 import com.github.houbb.opencc4j.util.ZhConverterUtil
 import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : ComponentActivity() {
     private var statusText by mutableStateOf(
@@ -49,6 +61,25 @@ class MainActivity : ComponentActivity() {
     private var isInitializing by mutableStateOf(false)
     private var isRecognizing by mutableStateOf(false)
     private var isOcrReady by mutableStateOf(false)
+
+    private val mediaProjectionManager by lazy {
+        getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+    }
+    private var captureProjection: MediaProjection? = null
+    private var captureImageReader: ImageReader? = null
+    private var captureDisplay: VirtualDisplay? = null
+
+    private val screenCaptureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            startScreenCapture(result.resultCode, result.data!!)
+        } else {
+            statusText = "截图权限被拒绝"
+            isRecognizing = false
+            stopService(Intent(this, ScreenCaptureService::class.java))
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -64,6 +95,7 @@ class MainActivity : ComponentActivity() {
                         isOcrReady = isOcrReady,
                         onInitClick = ::initializeOcr,
                         onImageSelected = ::recognizeImage,
+                        onScreenCapture = ::captureScreen,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -72,14 +104,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        cleanupScreenCapture()
         OCR.getInstance(applicationContext).release()
         super.onDestroy()
     }
 
     private fun initializeOcr() {
-        if (isInitializing) {
-            return
-        }
+        if (isInitializing) return
 
         val apiKey = BuildConfig.BAIDU_OCR_API_KEY
         val secretKey = BuildConfig.BAIDU_OCR_SECRET_KEY
@@ -121,10 +152,137 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun recognizeImage(uri: Uri) {
-        if (isRecognizing) {
+    private fun captureScreen() {
+        if (!isOcrReady) {
+            statusText = "请先初始化 OCR。"
             return
         }
+        if (isRecognizing) return
+
+        val serviceIntent = Intent(this, ScreenCaptureService::class.java)
+        startForegroundService(serviceIntent)
+        screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+    }
+
+    private fun startScreenCapture(resultCode: Int, data: Intent) {
+        isRecognizing = true
+        statusText = "正在截屏..."
+
+        val projection =
+            mediaProjectionManager.getMediaProjection(resultCode, data) ?: run {
+                isRecognizing = false
+                statusText = "截图失败：无法获取 MediaProjection"
+                stopService(Intent(this, ScreenCaptureService::class.java))
+                return
+            }
+
+        projection.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                runOnUiThread {
+                    isRecognizing = false
+                    statusText = "截图服务被系统终止"
+                    cleanupScreenCapture()
+                }
+            }
+        }, Handler(Looper.getMainLooper()))
+
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        val handlerThread = HandlerThread("ScreenCapture")
+        handlerThread.start()
+        val handler = Handler(handlerThread.looper)
+
+        var captured = false
+
+        imageReader.setOnImageAvailableListener({ reader ->
+            if (captured) return@setOnImageAvailableListener
+            captured = true
+
+            val image = reader.acquireLatestImage()
+            if (image == null) {
+                handlerThread.quitSafely()
+                runOnUiThread {
+                    isRecognizing = false
+                    statusText = "截图失败：无法获取图像"
+                    cleanupScreenCapture()
+                }
+                return@setOnImageAvailableListener
+            }
+
+            try {
+                val planes = image.planes
+                val buffer = planes[0].buffer
+                val pixelStride = planes[0].pixelStride
+                val rowStride = planes[0].rowStride
+                val rowPadding = rowStride - pixelStride * width
+
+                val fullBitmap = Bitmap.createBitmap(
+                    width + rowPadding / pixelStride,
+                    height, Bitmap.Config.ARGB_8888
+                )
+                fullBitmap.copyPixelsFromBuffer(buffer)
+
+                val bitmap = if (rowPadding > 0) {
+                    val cropped = Bitmap.createBitmap(fullBitmap, 0, 0, width, height)
+                    fullBitmap.recycle()
+                    cropped
+                } else {
+                    fullBitmap
+                }
+                image.close()
+
+                runOnUiThread {
+                    statusText = "截图完成，正在保存..."
+                    val file =
+                        File(cacheDir, "ocr-screenshot-${System.currentTimeMillis()}.jpg")
+                    FileOutputStream(file).use { fos ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fos)
+                    }
+                    bitmap.recycle()
+                    cleanupScreenCapture()
+                    recognizeFile(file)
+                }
+            } catch (e: Exception) {
+                image.close()
+                runOnUiThread {
+                    isRecognizing = false
+                    statusText = "截图失败：${e.message}"
+                    cleanupScreenCapture()
+                }
+            } finally {
+                handlerThread.quitSafely()
+            }
+        }, handler)
+
+        val virtualDisplay = projection.createVirtualDisplay(
+            "ScreenCapture",
+            width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader.surface,
+            null, null
+        )
+
+        captureProjection = projection
+        captureImageReader = imageReader
+        captureDisplay = virtualDisplay
+    }
+
+    private fun cleanupScreenCapture() {
+        try { captureDisplay?.release() } catch (_: Exception) {}
+        try { captureImageReader?.close() } catch (_: Exception) {}
+        try { captureProjection?.stop() } catch (_: Exception) {}
+        captureDisplay = null
+        captureImageReader = null
+        captureProjection = null
+        stopService(Intent(this, ScreenCaptureService::class.java))
+    }
+
+    private fun recognizeImage(uri: Uri) {
+        if (isRecognizing) return
         if (!isOcrReady) {
             statusText = "请先初始化 OCR。"
             return
@@ -136,7 +294,20 @@ class MainActivity : ComponentActivity() {
             statusText = "读取图片失败：${error.message ?: "未知错误"}"
             return
         }
+        recognizeFile(imageFile)
+    }
 
+    private fun copyUriToCache(uri: Uri): File {
+        val targetFile = File(cacheDir, "ocr-input-${System.currentTimeMillis()}.jpg")
+        contentResolver.openInputStream(uri)?.use { inputStream ->
+            targetFile.outputStream().use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        } ?: error("无法打开所选图片")
+        return targetFile
+    }
+
+    private fun recognizeFile(imageFile: File) {
         val params = GeneralParams().apply {
             setDetectDirection(true)
             setVertexesLocation(true)
@@ -153,7 +324,8 @@ class MainActivity : ComponentActivity() {
                 override fun onResult(result: GeneralResult) {
                     runOnUiThread {
                         isRecognizing = false
-                        statusText = "识别完成，共 ${result.wordsResultNumber} 段，direction=${result.direction}"
+                        statusText =
+                            "识别完成，共 ${result.wordsResultNumber} 段，direction=${result.direction}"
                         resultText = formatResult(result)
                     }
                 }
@@ -172,16 +344,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         )
-    }
-
-    private fun copyUriToCache(uri: Uri): File {
-        val targetFile = File(cacheDir, "ocr-input-${System.currentTimeMillis()}.jpg")
-        contentResolver.openInputStream(uri)?.use { inputStream ->
-            targetFile.outputStream().use { outputStream ->
-                inputStream.copyTo(outputStream)
-            }
-        } ?: error("无法打开所选图片")
-        return targetFile
     }
 
     private fun formatResult(result: GeneralResult): String {
@@ -232,6 +394,7 @@ private fun OcrDebugScreen(
     isOcrReady: Boolean,
     onInitClick: () -> Unit,
     onImageSelected: (Uri) -> Unit,
+    onScreenCapture: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val pickerLauncher = rememberLauncherForActivityResult(
@@ -256,7 +419,7 @@ private fun OcrDebugScreen(
             style = MaterialTheme.typography.headlineSmall
         )
         Text(
-            text = "当前只验证最小链路：AK/SK 鉴权 + 选图识别 + 返回文字位置。",
+            text = "验证链路：AK/SK 鉴权 → 截图/选图 → OCR → 繁转简。",
             style = MaterialTheme.typography.bodyMedium
         )
 
@@ -269,22 +432,36 @@ private fun OcrDebugScreen(
         }
 
         Button(
+            onClick = onScreenCapture,
+            enabled = isOcrReady && !isInitializing && !isRecognizing,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (isRecognizing) "处理中..." else "截图识别")
+        }
+
+        Button(
             onClick = { pickerLauncher.launch("image/*") },
             enabled = isOcrReady && !isInitializing && !isRecognizing,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (isRecognizing) "识别中..." else "选择图片并识别")
+            Text(if (isRecognizing) "处理中..." else "选择图片并识别")
         }
 
         Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Text(text = "状态", style = MaterialTheme.typography.titleMedium)
                 Text(text = statusText, style = MaterialTheme.typography.bodyMedium)
             }
         }
 
         Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Text(text = "识别结果", style = MaterialTheme.typography.titleMedium)
                 if (resultText.isBlank()) {
                     Text(text = "暂无结果", style = MaterialTheme.typography.bodyMedium)
@@ -313,12 +490,13 @@ fun GreetingPreview() {
     SimpMangTheme {
         OcrDebugScreen(
             statusText = "状态示例",
-            resultText = "1. 測試文字  [left=12, top=24, width=180, height=42]",
+            resultText = "1. 測試文字 → 测试文字  [left=12, top=24, width=180, height=42]",
             isInitializing = false,
             isRecognizing = false,
             isOcrReady = true,
             onInitClick = {},
-            onImageSelected = {}
+            onImageSelected = {},
+            onScreenCapture = {}
         )
     }
 }
