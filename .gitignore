@@ -17,6 +17,7 @@ gen/
 out/
 .navigation/
 *.log
+log.txt
 *.hprof
 *.keystore
 !debug.keystore
